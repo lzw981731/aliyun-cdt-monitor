@@ -1,3 +1,6 @@
+
+
+```markdown
 # 阿里云 CDT / ECS 流量与费用智能监控面板
 
 [![PHP Version](https://img.shields.io/badge/php-%3E%3D7.4-blue)](https://www.php.net/)
@@ -55,3 +58,85 @@ return [
     
     // ... 其他阈值配置 ...
 ];
+
+```
+
+### 3. 访问测试
+
+在浏览器中访问：`http://您的域名/index.html`
+
+如果显示“等待数据...”，请尝试手动访问 API 接口进行初始化：
+`http://您的域名/api.php?key=配置文件中设置的cron_key`
+
+## ⚙️ 阿里云 RAM 权限说明
+
+建议创建一个 **RAM 子用户** 专门用于此脚本，**不要**使用主账号 AccessKey。
+该子用户需要以下权限：
+
+1. **AliyunECSReadOnlyAccess** (读取 ECS 状态、IP 等)
+2. **AliyunBSSReadOnlyAccess** (读取账单费用)
+3. **AliyunCDTReadOnlyAccess** (读取 CDT 流量详情)
+4. **自定义权限 (用于关机)**：
+如果开启了自动关机功能，还需要赋予 `StopInstance` 权限。你可以创建一个自定义策略：
+
+```json
+{
+    "Version": "1",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "ecs:StopInstance",
+                "ecs:StartInstance"
+            ],
+            "Resource": "*"
+        }
+    ]
+}
+
+```
+
+## ⏰ 定时任务 (Crontab)
+
+为了实现自动监控和熔断保护，你需要配置服务器的定时任务，每分钟执行一次检测。
+
+**Linux Crontab 示例：**
+
+```bash
+# 每分钟请求一次 API，触发监控逻辑
+* * * * * curl -s "[http://127.0.0.1/api.php?key=您的CRON密钥](http://127.0.0.1/api.php?key=您的CRON密钥)" > /dev/null
+
+```
+
+或者在宝塔面板的“计划任务”中添加一个“访问 URL”的任务。
+
+## 📂 目录结构
+
+```text
+/
+├── index.html          # 前端主页 (纯静态)
+├── api.php             # API 入口文件
+└── lib/
+    ├── api.php         # 核心逻辑处理
+    ├── app.js          # 前端逻辑脚本
+    ├── style.css       # 样式表
+    ├── config.php      # 配置文件 (需手动创建)
+    ├── AliyunClient.php # 阿里云 API 客户端类
+    ├── Functions.php   # 公共函数库
+    └── ...
+
+```
+
+## ⚠️ 免责声明
+
+* 本工具涉及对云服务器的自动操作（如关机），虽然经过测试，但**开发者不对因软件错误、配置错误或网络延迟导致的任何费用损失或数据丢失承担责任**。
+* 请务必先在测试环境中验证阈值配置是否符合您的预期。
+* **请勿公开您的 `config.php` 文件！**
+
+## 📄 License
+
+MIT License
+
+```
+
+```
