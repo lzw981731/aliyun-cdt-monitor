@@ -1,6 +1,3 @@
-
-
-```markdown
 # 阿里云 CDT / ECS 流量与费用智能监控面板
 
 [![PHP Version](https://img.shields.io/badge/php-%3E%3D7.4-blue)](https://www.php.net/)
