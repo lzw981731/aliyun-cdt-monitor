@@ -40,6 +40,10 @@ try {
     $isDryRun = $config['dry_run'];
 
     $lastState = file_exists($dataFile) ? json_decode(file_get_contents($dataFile), true) : ['percent' => 0, 'status' => 'Unknown', 'cost_alert_sent' => false];
+
+    $startRetryCount = isset($lastState['start_retry_count']) ? intval($lastState['start_retry_count']) : 0;
+    $startSleepMode = isset($lastState['start_sleep_mode']) ? $lastState['start_sleep_mode'] : false;
+
     $client = new AliyunClient($config['access_key_id'], $config['access_key_secret'], $config['region_id']);
 
     // 1. 查流量
@@ -60,52 +64,71 @@ try {
     // 获取状态
     $currentStatus = isset($res['Instances']['Instance'][0]['Status']) ? $res['Instances']['Instance'][0]['Status'] : 'Unknown';
 
-    // 获取 IPv4
-    $publicIp = '';
+    if ($currentStatus === 'Running') {
+        if ($startSleepMode && ($config['bark']['enable'] || $config['telegram']['enable'])) {
+            sendNotify($config, "✅ 服务器重启成功", "系统已恢复运行状态，启动重试次数清零，解除推送通知休眠。");
+            $logsInfo[] = ['type' => 'SUCCESS', 'msg' => "✅ 服务器已恢复运行，解除通知休眠", 'time' => date('H:i:s')];
+        }
+        $startRetryCount = 0;
+        $startSleepMode = false;
+    }
+
+    // 获取IP并打码
+    $rawIp = '无公网IP';
+    // 优先获取分配的公网IP
     if (!empty($res['Instances']['Instance'][0]['PublicIpAddress']['IpAddress'][0])) {
-        $publicIp = $res['Instances']['Instance'][0]['PublicIpAddress']['IpAddress'][0];
-    } elseif (!empty($res['Instances']['Instance'][0]['EipAddress']['IpAddress'])) {
-        $publicIp = $res['Instances']['Instance'][0]['EipAddress']['IpAddress'];
+        $rawIp = $res['Instances']['Instance'][0]['PublicIpAddress']['IpAddress'][0];
+    }
+    // 其次获取弹性公网IP (EIP)
+    elseif (!empty($res['Instances']['Instance'][0]['EipAddress']['IpAddress'])) {
+        $rawIp = $res['Instances']['Instance'][0]['EipAddress']['IpAddress'];
     }
 
-    // 获取 IPv6
-    $ipv6 = '';
-    if (!empty($res['Instances']['Instance'][0]['Ipv6Address']['Ipv6Address'][0])) {
-        $ipv6 = $res['Instances']['Instance'][0]['Ipv6Address']['Ipv6Address'][0];
-    } elseif (!empty($res['Instances']['Instance'][0]['NetworkInterfaces']['NetworkInterface'][0]['Ipv6Sets']['Ipv6Set'][0]['Ipv6Address'])) {
-        // 备用: 从网卡信息获取
-        $ipv6 = $res['Instances']['Instance'][0]['NetworkInterfaces']['NetworkInterface'][0]['Ipv6Sets']['Ipv6Set'][0]['Ipv6Address'];
-    }
-
-    $displayIps = [];
-
-    // IPv4 脱敏处理 (47.1.2.3 -> 47.1.xxx.3)
-    if ($publicIp && filter_var($publicIp, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-        $parts = explode('.', $publicIp);
+    // IP 脱敏处理 (例如: 47.1.2.3 -> 47.1.xxx.3)
+    $displayIp = $rawIp;
+    if (filter_var($rawIp, FILTER_VALIDATE_IP)) {
+        $parts = explode('.', $rawIp);
         if (count($parts) === 4) {
-            $displayIps[] = $parts[0] . '.' . $parts[1] . '.xxx.' . $parts[3];
-        } else {
-            $displayIps[] = $publicIp;
+            $displayIp = $parts[0] . '.' . $parts[1] . '.xxx.' . $parts[3];
         }
     }
 
-    // IPv6 脱敏处理 (2400:3200:abcd:1234::1 -> 2400:3200:****:****::1)
-    if ($ipv6 && filter_var($ipv6, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
-        $parts = explode(':', $ipv6);
-        if (count($parts) >= 4) {
-            // 简单脱敏: 保留前2段和最后1段
-            $displayIps[] = $parts[0] . ':' . $parts[1] . ':****:****::' . end($parts);
-        } else {
-            $displayIps[] = substr($ipv6, 0, 9) . '****' . substr($ipv6, -4);
+    // 获取 IPv6并尝试脱敏
+    $ipv6Raw = '';
+    if (!empty($res['Instances']['Instance'][0]['NetworkInterfaces']['NetworkInterface'][0]['NetworkInterfaceId'])) {
+        $eniId = $res['Instances']['Instance'][0]['NetworkInterfaces']['NetworkInterface'][0]['NetworkInterfaceId'];
+        // 通过网卡ID额外查询IPv6地址详情
+        try {
+            $eniRes = $client->request($ecsDomain, '2014-05-26', 'DescribeNetworkInterfaces', ['NetworkInterfaceId.1' => $eniId]);
+            if (!empty($eniRes['NetworkInterfaceSets']['NetworkInterfaceSet'][0]['Ipv6Sets']['Ipv6Set'][0]['Ipv6Address'])) {
+                $ipv6Raw = $eniRes['NetworkInterfaceSets']['NetworkInterfaceSet'][0]['Ipv6Sets']['Ipv6Set'][0]['Ipv6Address'];
+            }
+        } catch (Exception $e) {
+            $logsTopWarn[] = ['type' => 'WARN', 'msg' => "⚠️ IPv6查询失败: " . $e->getMessage(), 'time' => date('H:i:s')];
         }
     }
 
-    if (empty($displayIps)) {
-        $displayIp = 'No Public IP';
-    } else {
-        $displayIp = implode("\n", $displayIps);
-    }
+    $displayIpv6 = $ipv6Raw;
+    if ($ipv6Raw && filter_var($ipv6Raw, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+        // 解构脱敏: 只保留第一组十六进制，后面使用 ellipsis，以及最后一组
+        $parts = explode(':', trim($ipv6Raw));
 
+        $firstPart = $parts[0];
+
+        $lastPart = '';
+        for ($i = count($parts) - 1; $i >= 0; $i--) {
+            if ($parts[$i] !== '') {
+                $lastPart = $parts[$i];
+                break;
+            }
+        }
+
+        if ($lastPart === '' || $lastPart === $firstPart) {
+            $lastPart = 'xxxx';
+        }
+
+        $displayIpv6 = $firstPart . ':...:' . $lastPart;
+    }
 
     // 3. 查账单
     $totalCost = 0.00;
@@ -208,8 +231,24 @@ try {
     if ($canExecute && !$isDryRun) {
         if ($targetAction == 'START') {
             $client->request($ecsDomain, '2014-05-26', 'StartInstance', ['InstanceId' => $config['instance_id']]);
-            $logsTopWarn[] = ['type' => 'WARN', 'msg' => "🚀 执行开机: {$reason}", 'time' => date('H:i:s')];
-            sendNotify($config, "🚀 服务器已启动", "原因: {$reason}\n流量: {$currentPercent}%");
+
+            $maxRetries = isset($config['schedule']['max_start_retries']) ? intval($config['schedule']['max_start_retries']) : 3;
+
+            if (!$startSleepMode) {
+                $startRetryCount++;
+                if ($startRetryCount >= $maxRetries) {
+                    $startSleepMode = true;
+                    // 发送最后一次休眠通知
+                    sendNotify($config, "💤 开机通知已休眠", "开机尝试已连续失败 ({$maxRetries}次)，不再循环推送开机通知。\n(直到后台重启成功后将自动解除休眠)");
+                    $logsTopWarn[] = ['type' => 'WARN', 'msg' => "🛑 达到最大重试次数 ({$maxRetries}次)，开机通知进入休眠状态", 'time' => date('H:i:s')];
+                } else {
+                    sendNotify($config, "🚀 服务器正在开机", "尝试次数: {$startRetryCount}/{$maxRetries}\n原因: {$reason}\n流量: {$currentPercent}%");
+                    $logsTopWarn[] = ['type' => 'WARN', 'msg' => "🚀 执行开机 ({$startRetryCount}/{$maxRetries}): {$reason}", 'time' => date('H:i:s')];
+                }
+            } else {
+                // 休眠状态下静默启动，不发推送
+                $logsTopWarn[] = ['type' => 'WARN', 'msg' => "💤 开机重试推送休眠中... (仍在后台尝试静默开机)", 'time' => date('H:i:s')];
+            }
         } elseif ($targetAction == 'STOP') {
             $params = ['InstanceId' => $config['instance_id']];
             if (isset($config['stop_mode']) && $config['stop_mode'] == 1)
@@ -244,7 +283,13 @@ try {
     }
 
     $finalLogs = array_merge($logsTopWarn, $logsInfo, $logsBottom);
-    file_put_contents($dataFile, json_encode(['percent' => $currentPercent, 'status' => $currentStatus, 'cost_alert_sent' => $lastCostAlert]));
+    file_put_contents($dataFile, json_encode([
+        'percent' => $currentPercent,
+        'status' => $currentStatus,
+        'cost_alert_sent' => $lastCostAlert,
+        'start_retry_count' => $startRetryCount,
+        'start_sleep_mode' => $startSleepMode
+    ]));
 
     // 格式化输出
     $displayStatus = str_replace(['Running', 'Stopped', 'Starting', 'Stopping', 'Unknown'], ['运行中', '已停止', '启动中', '停止中', '未知'], $currentStatus);
@@ -256,6 +301,7 @@ try {
         'data' => [
             'status' => $displayStatus,
             'ip_address' => $displayIp, // <--- 新增字段
+            'ipv6_address' => $displayIpv6,
             'used' => $usedGb,
             'limit' => $limitGb,
             'percent' => $currentPercent,
