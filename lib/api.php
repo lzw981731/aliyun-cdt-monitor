@@ -135,7 +135,7 @@ try {
     $currency = 'USD';
     try {
         $billingCycle = date('Y-m');
-        $bssParams = ['BillingCycle' => $billingCycle, 'IsHideZeroCharge' => 'false', 'PageSize' => 100];
+        $bssParams = ['BillingCycle' => $billingCycle, 'IsHideZeroCharge' => 'false', 'PageSize' => 300];
         $accountType = isset($config['account_type']) ? $config['account_type'] : 'intl';
         $bssEndpoint = ($accountType === 'cn') ? 'business.aliyuncs.com' : 'business.ap-southeast-1.aliyuncs.com';
 
@@ -147,31 +147,60 @@ try {
             $itemId = isset($item['InstanceID']) ? $item['InstanceID'] : '';
             $currItemCurrency = isset($item['Currency']) ? $item['Currency'] : 'USD';
 
-            if ($amountVal > 0) {
+            if ($amountVal != 0) {
+                $totalCost += $amountVal;
+                $currency = $currItemCurrency;
                 $displayId = smartMaskId($itemId);
                 $fmtMoney = formatMoney($amountVal);
 
                 if ($itemId == $config['instance_id']) {
-                    $totalCost += $amountVal;
-                    $currency = $currItemCurrency;
-                    $logsInfo[] = ['type' => 'INFO', 'msg' => "账单匹配: {$fmtMoney} {$currency} (ID: {$displayId})", 'time' => date('H:i:s')];
+                    $logsInfo[] = ['type' => 'INFO', 'msg' => "账单匹配: {$fmtMoney} {$currency} (当前实例)", 'time' => date('H:i:s')];
                 } else {
-                    $hint = "未知资源";
+                    $hint = "其他资源";
                     if (strpos($itemId, 'i-') === 0)
-                        $hint = "闲置ECS实例/或者已经删除";
+                        $hint = "其他/历史ECS实例";
                     elseif (strpos($itemId, 'eip-') === 0)
                         $hint = "独立公网IP (EIP)";
-                    elseif (strpos($itemId, 'cn-') === 0 || strpos($itemId, 'ap-') === 0 || strpos($itemId, 'us-') === 0 || strpos($itemId, 'eu-') === 0)
-                        $hint = "OSS存储/快照费用";
-                    elseif (strpos($itemId, 'comm') !== false)
-                        $hint = "流量包/共用资源";
-                    $logsTopWarn[] = ['type' => 'WARN', 'msg' => "⚠️ 发现其他费用: {$fmtMoney} {$currItemCurrency} (ID: {$displayId}) - {$hint}", 'time' => date('H:i:s')];
+                    elseif (strpos($itemId, 'cn-') === 0 || strpos($itemId, 'ap-') === 0)
+                        $hint = "存储/快照/网络费用";
+                    $logsTopWarn[] = ['type' => 'WARN', 'msg' => "发现费用: {$fmtMoney} {$currency} (${hint})", 'time' => date('H:i:s')];
                 }
             }
         }
     } catch (Exception $e) {
         $logsTopWarn[] = ['type' => 'ERROR', 'msg' => "账单查询失败: " . $e->getMessage(), 'time' => date('H:i:s')];
     }
+
+    // --- 历史账单获取逻辑 ---
+    $prevBills = [];
+    $historyFile = __DIR__ . '/history_cache.json';
+    $historyCache = file_exists($historyFile) ? json_decode(file_get_contents($historyFile), true) : [];
+
+    try {
+        for ($i = 1; $i <= 2; $i++) {
+            $month = date('Y-m', strtotime("-$i month"));
+
+            // 账单查询 (计算该月总费用)
+            if (isset($historyCache[$month]['bill'])) {
+                $histAmount = $historyCache[$month]['bill'];
+            } else {
+                $histRes = $client->request($bssEndpoint, '2017-12-14', 'QueryInstanceBill', ['BillingCycle' => $month, 'IsHideZeroCharge' => 'false', 'PageSize' => 300]);
+                $histItems = isset($histRes['Data']['Items']['Item']) ? $histRes['Data']['Items']['Item'] : [];
+                $histAmount = 0;
+                foreach ($histItems as $hItem) {
+                    $histAmount += floatval($hItem['PretaxAmount']);
+                }
+                if ($histAmount != 0 && date('Y-m') > $month) {
+                    $historyCache[$month]['bill'] = $histAmount;
+                }
+            }
+            $prevBills[] = ['month' => $month, 'amount' => $histAmount];
+        }
+        file_put_contents($historyFile, json_encode($historyCache));
+    } catch (Exception $e) {
+        // 报错不中断主流程
+    }
+    // --------------------------------
 
     // 4. 汇总信息
     $logsInfo[] = ['type' => 'INFO', 'msg' => "🖥️ 运行状态: {$currentStatus}", 'time' => date('H:i:s')];
@@ -239,7 +268,7 @@ try {
                 if ($startRetryCount >= $maxRetries) {
                     $startSleepMode = true;
                     // 发送最后一次休眠通知
-                    sendNotify($config, "💤 开机通知已休眠", "开机尝试已连续失败 ({$maxRetries}次)，不再循环推送开机通知。\n(直到后台重启成功后将自动解除休眠)");
+                    sendNotify($config, "💤 开机通知已休眠", "开机尝试已连续失败 ({$maxRetries}次)，不再循环推送开机通知，如需查看状态可以前往监控前端查看。\n(直到后台重启成功后将自动解除休眠)");
                     $logsTopWarn[] = ['type' => 'WARN', 'msg' => "🛑 达到最大重试次数 ({$maxRetries}次)，开机通知进入休眠状态", 'time' => date('H:i:s')];
                 } else {
                     sendNotify($config, "🚀 服务器正在开机", "尝试次数: {$startRetryCount}/{$maxRetries}\n原因: {$reason}\n流量: {$currentPercent}%");
@@ -309,7 +338,9 @@ try {
             'bill_amount' => $totalCost,
             'bill_currency' => $currency,
             'bill_limit' => $costLimit,
-            'cost_stop_enabled' => $costStopEnabled
+            'cost_stop_enabled' => $costStopEnabled,
+            'prev_bills' => $prevBills,
+            'prev_traffic' => [] // <--- 移除历史流量
         ],
         'logs' => $finalLogs,
         'mode' => $modeText

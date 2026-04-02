@@ -97,8 +97,7 @@ body {
 /* 仅针对移动端缩小 IP 字体 */
 @media (max-width: 576px) {
 
-    #ip-val,
-    #ipv6-val {
+    #ip-list-container .info-value {
         font-size: 0.58rem !important;
         word-break: break-all;
     }
